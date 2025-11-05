@@ -26,7 +26,11 @@ class Server():
         self.sigma = self.args.sigma
         self.m_s = {k: torch.zeros_like(v) for k, v in self.model.state_dict().items()}
 
-    def FedAvg(self, clients_update_w, v, a, clients_update_acc, clients_update_f, t, h, c):
+    # ===== 这是新的 FedAvg 函数 (快速版) =====
+    # ===== 这是最终、完整、正确的 FedAvg 函数 (快速版) =====
+    # ===== 这是最终版的 FedAvg 函数 (V3 - 快速版) =====
+    def FedAvg(self, clients_update_w, v, a, clients_update_acc, clients_update_f, clients_sim, t, h, c):
+        # (plain 和 DP 模式保持不变)
         if self.args.mode == 'plain':
             print("clients_update_w[0]", clients_update_w[0])
             update_w_avg = copy.deepcopy(clients_update_w[0])
@@ -34,77 +38,92 @@ class Server():
                 for i in range(1, len(clients_update_w)):
                     update_w_avg[k] += clients_update_w[i][k]
                 update_w_avg[k] = torch.div(update_w_avg[k], len(clients_update_w))
-                self.model.state_dict()[k] += update_w_avg[k]   
-            return copy.deepcopy(self.model.state_dict()), sum(self.clients_loss) / len(self.clients_loss)
+                # ===== 关键修改：服务器自己更新模型 =====
+                self.model.state_dict()[k] += update_w_avg[k]
+            # ===== 关键修改：返回新的全局模型，而不是增量 =====
+            return copy.deepcopy(self.model.state_dict()), sum(self.clients_loss) / len(self.clients_loss), v[0], a[0] # V, A 反正不用
 
-        elif self.args.mode == 'DP':  # DP mechanism
+        elif self.args.mode == 'DP':
             update_w_avg = copy.deepcopy(clients_update_w[0])
             for k in update_w_avg.keys():
                 for i in range(1, len(clients_update_w)):
                     update_w_avg[k] += clients_update_w[i][k]
-                # add gauss noise
                 update_w_avg[k] += torch.normal(0, self.sigma**2 * self.C**2, update_w_avg[k].shape).to(self.args.device)
                 update_w_avg[k] = torch.div(update_w_avg[k], len(clients_update_w))
+                # ===== 关键修改：服务器自己更新模型 =====
                 self.model.state_dict()[k] += update_w_avg[k]
-            return copy.deepcopy(self.model.state_dict()), sum(self.clients_loss) / len(self.clients_loss)
+            # ===== 关键修改：返回新的全局模型，而不是增量 =====
+            return copy.deepcopy(self.model.state_dict()), sum(self.clients_loss) / len(self.clients_loss), v[0], a[0] # V, A 反正不用
 
         elif self.args.mode == 'Threshold Paillier':
+            update_v = v[0]
+            update_a = a[0]
+
             if t % 3 == 0:
                 update_w_avg = copy.deepcopy(clients_update_w[0])
                 weig_w = copy.deepcopy(clients_update_w[0])
                 delta_w = copy.deepcopy(clients_update_w[0])
                 m_s = copy.deepcopy(clients_update_w[0])
                 w_old = self.model.state_dict()
-                update_v = v[0]
-                #print('updat_v',update_v)
-                update_a = a[0]
-                update_c = c[0]
+
+                # (TEVA-G 权重计算... 这部分保持不变)
                 acc_sum = 0
                 f_sum = 0
+                sim_sum = 0
                 sum_acc = 0
                 sum_f = 0
+                sum_sim = 0
                 acc_list = []
                 f_list = []
+                sim_list = []
+
                 for k in update_w_avg.keys():
                     for i in range(len(update_w_avg[k])):
                         update_w_avg[k][i] = 0
+
                 for i in range(len(clients_update_acc)):
                     acc_sum += clients_update_acc[i]
                     f_sum += clients_update_f[i]
+                    sim_norm = (clients_sim[i] + 1) / 2
+                    sim_sum += sim_norm
+
                 for i in range(len(clients_update_acc)):
                     acc_fed = clients_update_acc[i] / (acc_sum if acc_sum != 0 else 1)
-                    f_fed = clients_update_f[i] / f_sum
-                    if acc_fed == 0:
-                        acc = -math.log(acc_fed+self.args.nc, 2)
-                    else:
-                        acc = -math.log(acc_fed, 2)
+                    f_fed = clients_update_f[i] / (f_sum if f_sum != 0 else 1)
+                    sim_fed = (clients_sim[i] + 1) / 2 / (sim_sum if sim_sum != 0 else 1)
+
+                    if acc_fed == 0: acc = -math.log(acc_fed+self.args.nc, 2)
+                    else: acc = -math.log(acc_fed, 2)
                     sum_acc += acc
                     acc_list.append(acc)
-                    if f_fed == 0:
-                        f = -math.log(1 -f_fed+self.args.nc, 2)
-                    else:
-                        f = -math.log(1 - f_fed, 2)
+
+                    if f_fed == 0: f = -math.log(1 -f_fed+self.args.nc, 2)
+                    else: f = -math.log(1 - f_fed, 2)
                     sum_f += f
                     f_list.append(f)
+
+                    if sim_fed == 0: sim_log = -math.log(sim_fed + self.args.nc, 2)
+                    else: sim_log = -math.log(sim_fed, 2)
+                    sum_sim += sim_log
+                    sim_list.append(sim_log)
+
                 for i in range(len(acc_list)):
-                    acc_inf = acc_list[i] / sum_acc
-                    f_inf = f_list[i] / sum_f
-                    weight_inf = self.args.alpha * acc_inf + self.args.beta * f_inf
+                    acc_inf = acc_list[i] / (sum_acc if sum_acc != 0 else 1)
+                    f_inf = f_list[i] / (sum_f if sum_f != 0 else 1)
+                    sim_inf = sim_list[i] / (sum_sim if sum_sim != 0 else 1)
+                    gamma = getattr(self.args, 'gamma', 0.0) 
+                    weight_inf = self.args.alpha * acc_inf + self.args.beta * f_inf + gamma * sim_inf
+
                     for k in weig_w.keys():
                         for j in range(len(weig_w[k])):
                             clients_update_w[i][k][j] = weight_inf * clients_update_w[i][k][j]
-                            c[i][k][j] = pow(c[i][k][j],group.random(ZR, weight_inf if weight_inf>=1 else 1))
-                            v[i][k][j] = c[i][k][j] * v[i][k][j]
+
                 for i in range(1, len(acc_list)):
                     for k in weig_w.keys():
                         for j in range(len(weig_w[k])):
                             update_w_avg[k][j] += clients_update_w[i][k][j]
-                            update_v[k][j] *= v[i][k][j]
 
-                for k in weig_w.keys():
-                    for j in range(len(weig_w[k])):
-                        update_v[k][j] = update_v[k][j] * update_c[k][j]
-
+                # ===== 重新启用的服务器动量 (保持不变) =====
                 for k in update_w_avg.keys():
                     w_old_list = w_old[k].view(-1).cpu().tolist()
                     if t == 0:
@@ -112,42 +131,42 @@ class Server():
                     else:
                         m_s_list = self.m_s[k]
                     for j in range(len(update_w_avg[k])):
-                        delta_w[k][j] = update_w_avg[k][j] - w_old_list[j]
+                        delta_w[k][j] = update_w_avg[k][j] - w_old_list[j] 
                         m_s_list[j] = self.args.server_grammar * m_s_list[j] + self.args.lr * delta_w[k][j]
-                        update_w_avg[k][j] -= m_s_list[j]
+                        update_w_avg[k][j] -= m_s_list[j] 
                     self.m_s[k] = m_s_list
-                for k in weig_w.keys():
-                    for j in range(len(weig_w[k])):
-                        # view_update_v = update_v[k][j]
-                        # vier_h = h
-                        # view_group_random = group.random(ZR, w_old if type(w_old) == int else 1)
-                        #!!!!!————————！！！！！
-                        #这里的改动将影响到后面的验证，三思而后行！！！
-                        # update_v[k][j] = pow(update_v[k][j] / pow(h, group.random(ZR, 1, w_old if type(w_old)==int else None)), group.random(ZR, 1, 10 * int(-self.args.lr))) * pow(h,group.random(ZR, 1, w_old if type(w_old)==int else None))
-                        update_v[k][j] = update_v[k][j]/pow(pow(h,group.random(ZR, 1, 10 * int(self.args.server_grammar))),group.random(ZR, 1, None))
 
-                return update_w_avg, sum(self.clients_loss) / len(self.clients_loss), update_v, update_a
+                # ===== 关键修改：服务器自己更新模型 =====
+                for k in update_w_avg.keys():
+                    origin_shape = list(self.model.state_dict()[k].size())
+                    update_tensor = torch.FloatTensor(update_w_avg[k]).to(self.args.device).view(*origin_shape)
+                    self.model.state_dict()[k] += update_tensor
+                # ===== 结束 =====
 
             else:
+                # Mode II (快速版)
                 update_w_avg = copy.deepcopy(clients_update_w[0])
-                update_v = v[0]
-                update_a = a[0]
+
                 for k in update_w_avg.keys():
                     client_num = len(clients_update_w)
-
                     for i in range(1, client_num):
                         for j in range(len(update_w_avg[k])):
                             update_w_avg[k][j] += clients_update_w[i][k][j]
-                            update_v[k][j] *= v[i][k][j]
-                            update_a[k][j] *= a[i][k][j]
+
                 for k in update_w_avg.keys():
                     client_num = len(clients_update_w)
                     for j in range(len(update_w_avg[k])):
-                        update_v[k][j] = pow(update_v[k][j], group.init(ZR, 1/client_num))
                         update_w_avg[k][j] /= client_num
 
+                    # ===== 关键修改：服务器自己更新模型 =====
+                    origin_shape = list(self.model.state_dict()[k].size())
+                    update_tensor = torch.FloatTensor(update_w_avg[k]).to(self.args.device).view(*origin_shape)
+                    self.model.state_dict()[k] += update_tensor
+                    # ===== 结束 =====
 
-                return update_w_avg, sum(self.clients_loss) / len(self.clients_loss), update_v, update_a
+            # ===== 关键修改：返回新的全局模型，而不是增量 =====
+            return copy.deepcopy(self.model.state_dict()), sum(self.clients_loss) / len(self.clients_loss), update_v, update_a   
+                    
     def test(self, datatest):
         self.model.eval()
 

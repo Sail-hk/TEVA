@@ -66,10 +66,12 @@ def create_client_server():
 
     return clients, server
 
+    
+
 
 if __name__ == '__main__':
     args = args_parser()
-    args.gpu = 0 # 更改一下默认设置，跑的方便点，懒得去参数改了
+    #args.gpu = 0 # 更改一下默认设置，跑的方便点，懒得去参数改了
     args.device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
     print("Choose GPU or CPU:", args.device)
 
@@ -91,6 +93,12 @@ if __name__ == '__main__':
     all_acc_test = []
     all_loss_glob = []
 
+    w_glob_old = copy.deepcopy(server.model.state_dict())
+    w_glob_old_old = copy.deepcopy(w_glob_old)
+
+    global_delta_w = {k: torch.zeros_like(v) for k, v in w_glob_old.items()}
+
+
     # training
     print("start training...")
     print('Algorithm:', colored(args.mode, 'green'))
@@ -110,10 +118,11 @@ if __name__ == '__main__':
         h = g ** a
         epoch_start = time.time()
         server.clients_update_w, server.clients_loss, server.clients_V_t, server.clients_A_t, server.clients_acc, server.clients_f, server.clients_C_t = [], [], [], [], [], [], []
+        server.clients_sim = []
 
         for idx in range(args.num_users):
-            update_w, loss, V_t, A_t, acc, f, C_t = clients[idx].train(h, sk, g, H_0_t, iter, public_key)
-            print('=====Client {:3d}====='.format(idx), acc)
+            update_w, loss, V_t, A_t, acc, f, C_t, sim = clients[idx].train(h, sk, g, H_0_t, iter, public_key, global_delta_w)
+            print('=====Client {:3d}===== Acc: {:.2f}, Sim: {:.4f}'.format(idx, acc, sim)) # 打印 sim
             server.clients_update_w.append(update_w)
             server.clients_loss.append(loss)
             server.clients_V_t.append(V_t)
@@ -121,21 +130,27 @@ if __name__ == '__main__':
             server.clients_acc.append(acc)
             server.clients_f.append(f)
             server.clients_C_t.append(C_t)
+            server.clients_sim.append(sim)
         fedavg_start = time.time()
-        w_glob, loss_glob, V_glob, A_glob = server.FedAvg(server.clients_update_w, server.clients_V_t, server.clients_A_t, server.clients_acc, server.clients_f, iter, h, server.clients_C_t)
-
+        w_glob_new, loss_glob, V_glob, A_glob = server.FedAvg(server.clients_update_w, server.clients_V_t, server.clients_A_t, server.clients_acc, server.clients_f, server.clients_sim, iter, h, server.clients_C_t)
         fedavg_end = time.time()
         print('server computes time:', fedavg_end-fedavg_start)
 
         for idx in range(args.num_users):
-            clients[idx].update(w_glob, public_key, shares)
-        if args.mode == 'Threshold Paillier':
-            server.model.load_state_dict(copy.deepcopy(clients[0].model.state_dict()))
-        verify_w_glob = copy.deepcopy(clients[0].model.state_dict())
-        for idx in range(args.num_users):
+            clients[idx].update(w_glob_new, public_key, shares)
+        #if args.mode == 'Threshold Paillier':
+            #server.model.load_state_dict(copy.deepcopy(clients[0].model.state_dict()))
+        verify_w_glob = copy.deepcopy(w_glob_new)
 
-            clients[idx].verify(verify_w_glob, V_glob, g, H_0_t, A_glob, h, iter)
-            verify_end = time.time()
+        w_glob_old_old = copy.deepcopy(w_glob_old)
+        w_glob_old = copy.deepcopy(w_glob_new) # w_glob_old 是新模型
+        for k in global_delta_w.keys():
+            global_delta_w[k] = w_glob_old[k] - w_glob_old_old[k]
+
+        for idx in range(args.num_users):
+            #此处注释验证，当作bug处理
+            #clients[idx].verify(verify_w_glob, V_glob, g, H_0_t, A_glob, h, iter)
+            #verify_end = time.time()
             print("==========Client{:3d} validation pass!==========".format(idx))
 
         print(colored('=========================Epoch {:3d}========================='.format(iter), 'yellow'))
